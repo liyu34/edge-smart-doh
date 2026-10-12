@@ -27,7 +27,9 @@ export function storedEdns(packet: DnsPacket): DnsPacket {
  * cache, had in it: none for a query without OPT (RFC 6891 §7), and one for a query with OPT (§6.1.1)
  * carrying the query's DO bit, the client's own ECS only when it sent one (RFC 7871 §7.2.2; the
  * scope is upstream's, never wider than the client's source prefix), and padding to a 468-byte
- * block when the query was padded (RFC 8467), so the answer's length does not give the name away.
+ * block (RFC 8467), so the answer's length does not give the name away. RFC 7830 §3 requires padding
+ * when the query was padded and allows it whenever the query has OPT; many clients (mihomo and other
+ * stub forwarders) never pad, so every answer to an OPT query is padded, not only the padded ones'.
  */
 export function fitEdns(wire: Uint8Array, query: DnsPacket, client: ClientEcs | undefined): Uint8Array {
   const queryOpt = query.additionals.find((record) => record.type === DnsType.OPT);
@@ -40,8 +42,6 @@ export function fitEdns(wire: Uint8Array, query: DnsPacket, client: ClientEcs | 
   const ttl = ((((upstream?.ttl ?? 0) >>> 24) << 24) | (queryOpt.ttl & DO_FLAG)) >>> 0;
   const opt = (extra: EdnsOption[]): DnsRecord => ({ name: "", type: DnsType.OPT, class: UDP_PAYLOAD_SIZE, ttl, rdata: { kind: "opt", options: [...options, ...extra] } });
   const packet = encodeDnsPacket({ ...parsed, additionals: [...additionals, opt([])] });
-  const padded = queryOpt.rdata.kind === "opt" && queryOpt.rdata.options.some((option) => option.code === PADDING_OPTION_CODE);
-  if (!padded) return packet;
   const length = (PADDING_BLOCK - ((packet.length + 4) % PADDING_BLOCK)) % PADDING_BLOCK;
   return encodeDnsPacket({ ...parsed, additionals: [...additionals, opt([{ code: PADDING_OPTION_CODE, data: new Uint8Array(length) }])] });
 }

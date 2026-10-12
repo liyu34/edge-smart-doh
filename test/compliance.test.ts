@@ -162,19 +162,22 @@ describe("EDNS does not depend on which query filled the cache", () => {
     expect(fetchMock).toHaveBeenCalledTimes(1);
   });
 
-  it("a padded query gets a padded answer, a plain one never does (RFC 8467)", async () => {
+  it("every answer to an OPT query is padded to 468 bytes, padded query or not (RFC 7830, 8467)", async () => {
     stubUpstream();
     const plain = await ask(queryWire("c.example.org"));
     const padded = await ask(queryWire("c.example.org", opt([PADDING])));
     expect(padded.length % 468).toBe(0);
     expect(optionCodes(padded)).toEqual([12]);
     const unpadded = await ask(queryWire("c.example.org", opt()));
-    expect(optionCodes(unpadded)).toEqual([]);
+    expect(unpadded.length % 468).toBe(0);
+    expect(optionCodes(unpadded)).toEqual([12]);
+    // Without OPT there is nowhere to put padding (RFC 6891 §7).
     expect(await ask(queryWire("c.example.org"))).toHaveLength(plain.length);
+    expect(optOf(plain)).toBeUndefined();
     // Padded first: the cache does not keep the padding for the next client.
     await ask(queryWire("d.example.org", opt([PADDING])));
     expect(optOf(await ask(queryWire("d.example.org")))).toBeUndefined();
-    expect(optionCodes(await ask(queryWire("d.example.org", opt())))).toEqual([]);
+    expect(optionCodes(await ask(queryWire("d.example.org", opt())))).toEqual([12]);
   });
 
   it("the OPT carries the query's DO bit", async () => {
@@ -215,7 +218,8 @@ describe("a malformed client ECS option", () => {
     const fetchMock = stubUpstream();
     const reply = await ask(queryWire("g.example.cn", opt([{ code: 8, data: Uint8Array.from(data) }])), "58.247.1.1");
     expect(parseDnsPacket(reply).header.flags & 0x0f).toBe(1);
-    expect(optionCodes(reply)).toEqual([]);
+    // No ECS echoed for an option that could not be read; only the padding every OPT answer gets.
+    expect(optionCodes(reply)).toEqual([12]);
     expect(fetchMock).not.toHaveBeenCalled();
   });
 });
