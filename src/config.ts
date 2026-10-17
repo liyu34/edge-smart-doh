@@ -175,6 +175,7 @@ function relayForcedModeOf(value: string | undefined): RelayForcedMode {
  */
 const CF_SERVICE_DOMAINS = [".argotunnel.com", ".cftunnel.com", ".cloudflareclient.com"];
 
+
 export function readConfig(env: Env): AppConfig {
   const rawMode: string = env.ECS_MODE;
   const mode = rawMode === "off" || rawMode === "always" ? rawMode : "rules";
