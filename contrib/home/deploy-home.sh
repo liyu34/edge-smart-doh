@@ -175,7 +175,13 @@ log "edge-smart-doh 部署开始（日志：$LOG_FILE）OPEN_PUBLIC=$OPEN_PUBLIC
 log "步骤 1/8：依赖（nodejs/npm/jq/curl + caddy←backports）"
 export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
-apt-get install -y nodejs npm openssl curl jq dnsutils
+# nodejs/npm 按需安装：NodeSource 等第三方源的 nodejs 自带 npm 且与 Debian 的 npm 包互斥，
+# 机器上已有 node/npm（比如装过 NodeSource 24）时再请求 Debian 的 npm 会让 apt 在
+# "换回 Debian nodejs"上解析失败（2026-10-23 实录）。命令在就跳过，缺哪个补哪个。
+NODE_PKGS=()
+command -v node >/dev/null 2>&1 || NODE_PKGS+=(nodejs)
+command -v npm  >/dev/null 2>&1 || NODE_PKGS+=(npm)
+apt-get install -y openssl curl jq dnsutils ${NODE_PKGS[@]+"${NODE_PKGS[@]}"}
 if [[ "$OPEN_PUBLIC" == "1" ]]; then
   # main 源的 caddy 是 2.6.2，缺 client_ip matcher（≥2.7 才有），必须 backports 的 2.11.x
   apt-get install -y -t trixie-backports caddy || die "caddy(backports) 安装失败：检查 trixie-backports 源"
