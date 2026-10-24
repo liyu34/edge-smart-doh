@@ -112,8 +112,27 @@ export function recordQuery(sample: QuerySample, now = Date.now()): void {
     if (freshLatencies.length > FRESH_LATENCY_SAMPLES) freshLatencies.splice(0, freshLatencies.length - FRESH_LATENCY_SAMPLES);
   }
   const count = top.get(sample.name);
-  if (count !== undefined) top.set(sample.name, count + 1);
-  else if (top.size < TOP_TRACKED) top.set(sample.name, 1);
+  if (count !== undefined) {
+    top.set(sample.name, count + 1);
+  } else {
+    // Admission used to be one-time: once TOP_TRACKED distinct names had been seen, no new name
+    // could enter — random-subdomain telemetry (IoT, app beacons) filled the table with count-1
+    // entries and locked out every hot name that first appeared later. A new name now displaces
+    // the least-counted entry (oldest among ties; Map iteration is insertion order), so the table
+    // tracks what is hot now at the same fixed size.
+    if (top.size >= TOP_TRACKED) {
+      let victim: string | undefined;
+      let victimCount = Infinity;
+      for (const [name, entryCount] of top) {
+        if (entryCount < victimCount) {
+          victim = name;
+          victimCount = entryCount;
+        }
+      }
+      top.delete(victim!);
+    }
+    top.set(sample.name, 1);
+  }
   recent.push({ ...sample, t: now });
   if (recent.length > RECENT_MAX) recent.splice(0, recent.length - RECENT_MAX);
   if (sample.strategy) {

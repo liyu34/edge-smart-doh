@@ -84,13 +84,17 @@ describe("metrics", () => {
     expect(recent[99]!.name).toBe("n50.example");
   });
 
-  it("tracks top names without growing with traffic", () => {
+  it("tracks top names without growing with traffic: a late hot name displaces count-1 junk, a steady one survives", () => {
     resetMetrics();
+    for (let index = 0; index < 50; index += 1) recordQuery(query({ name: "steady.example" }));
+    // Random-subdomain telemetry fills the table past TOP_TRACKED with single-hit names.
     for (let index = 0; index < 1200; index += 1) recordQuery(query({ name: `n${index}.example` }));
-    recordQuery(query({ name: "n0.example" }));
+    // A name that only turns hot after the table is full must still get in.
+    for (let index = 0; index < 3; index += 1) recordQuery(query({ name: "late.example" }));
     const snapshot = statsSnapshot();
-    expect(snapshot.top[0]).toEqual({ name: "n0.example", count: 2 });
     expect(snapshot.top).toHaveLength(20);
+    expect(snapshot.top[0]).toEqual({ name: "steady.example", count: 50 });
+    expect(snapshot.top.find((entry) => entry.name === "late.example")).toEqual({ name: "late.example", count: 3 });
   });
 
   it("fills silent minutes with zero buckets and rolls old ones off", () => {
