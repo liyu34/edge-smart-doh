@@ -15,12 +15,12 @@ export type QueryOutcome = "hit" | "prefetch" | "stale" | "miss" | "blocked" | "
 export type UpstreamRole = "default" | "ecs" | "cn";
 
 /**
- * How a fresh resolution reached the name, rolled up for the console's path panel: "relay" the
- * answer was pinned to the SNI relay, "ech" the HTTPS record carried an injected ECH key, "cn" the
- * domestic split (CN upstreams), "pool" a measured/preferred pool pin or rewrite, "direct" the
- * upstream answer untouched. Cache hits carry no routing info, so paths describe fresh resolutions.
+ * How a fresh resolution reached the name, rolled up for the console's path panel: "ech" the HTTPS
+ * record carried an injected ECH key, "cn" the domestic split (CN upstreams), "pool" a
+ * measured/preferred pool pin or rewrite, "direct" the upstream answer untouched. Cache hits carry
+ * no routing info, so paths describe fresh resolutions.
  */
-export type QueryPath = "relay" | "ech" | "pool" | "cn" | "direct";
+export type QueryPath = "ech" | "pool" | "cn" | "direct";
 
 export interface QuerySample {
   name: string;
@@ -86,7 +86,7 @@ const FRESH_LATENCY_SAMPLES = 2000;
 const TOP_TRACKED = 1024;
 const TOP_REPORTED = 20;
 const STRATEGIES_MAX = 64;
-const PATHS: QueryPath[] = ["relay", "ech", "pool", "cn", "direct"];
+const PATHS: QueryPath[] = ["ech", "pool", "cn", "direct"];
 
 const startedAt = Date.now();
 const outcomes: Record<QueryOutcome, number> = { hit: 0, prefetch: 0, stale: 0, miss: 0, blocked: 0, error: 0 };

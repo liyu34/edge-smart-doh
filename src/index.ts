@@ -11,10 +11,9 @@ import { isIspName, ispScopeOf, ispTableReady, loadIspTable, onOperatorNetwork }
 import { recordQuery, statsSnapshot } from "./metrics";
 import { applyResponseRules, ecsOverride, loadRules, shouldBlock, type RuleSet } from "./rules";
 import { parseRequestOptions, type RequestOptions } from "./request-options";
-import { clearMetaEch, githubPoolFor, githubPoolStatus, githubReports, ispPoolStatus, learnedPoolStatus, metaEchOverride, metaEchStatus, preferredPool, scopedPoolStatus, setGithubPools, setLearnedPool, setMetaEch, setSitePools, sitePoolFor, sitePoolStatus, siteReports } from "./preferred";
+import { clearMetaEch, githubPoolStatus, githubReports, ispPoolStatus, learnedPoolStatus, metaEchOverride, metaEchStatus, preferredPool, scopedPoolStatus, setGithubPools, setLearnedPool, setMetaEch, setSitePools, sitePoolStatus, siteReports } from "./preferred";
 import { loadCloudflareRanges, validatedEchConfig } from "./rewrite";
 import { describePlan, makePlan, sortStrategies, strategyCacheTags, type RoutePlan } from "./plan";
-import { isLanClientAddress, parseRelayDomainPattern, relayOverrideSnapshot, relayStatus, setRelayHealth, setRelayOverride } from "./relay";
 import { renderPlan } from "./render";
 import { PUBLIC_STRATEGIES } from "./strategies";
 import { queryUpstreams, upstreamLabel } from "./upstream";
@@ -25,10 +24,10 @@ const DNS_CONTENT_TYPE = "application/dns-message";
 const STRATEGIES = sortStrategies(PUBLIC_STRATEGIES);
 
 /** `query`, when given, is the client's wire query: its question spelling is restored in the answer. */
-function dnsResponse(packet: Uint8Array, query?: Uint8Array, status = 200): Response {
+function dnsResponse(packet: Uint8Array, query?: Uint8Array, status = 200, client?: string): Response {
   let body = packet;
   try {
-    body = rotateAddressRecords(packet);
+    body = rotateAddressRecords(body, client);
   } catch {
     // A packet we cannot re-encode (unknown RDATA with compression) is served as-is.
   }
@@ -141,14 +140,14 @@ interface DnsSetup {
   options: RequestOptions;
   cache: Cache;
   ip?: string;
-  /**
-   * Whether the client address is on the LAN (relay gate, see relay.ts): resolved once here so every
-   * later decision — cache variant included — sees the same answer. False for a missing or
-   * unparsable address, which is the safe side.
-   */
-  lan: boolean;
   /** The address ECS is built from: the client's, ECS_FALLBACK_SUBNET for a client outside every operator, or none (non-routable client). */
   ecsIp?: string;
+  /**
+   * The client's network prefix (/24 IPv4, /48 IPv6): the stickiness key for address rotation
+   * (rotateAddressRecords). A client keeps one stable first address per pool even as its address
+   * inside the prefix changes (CGNAT reassignment); only a pool membership change moves it.
+   */
+  clientScope?: string;
   scope?: string;
   rules: RuleSet;
 }
@@ -170,6 +169,7 @@ async function prepareDns(request: Request, env: Env, runtime: RequestRuntime): 
   // The operator matters for the server default pool and for the ECS fallback.
   const ispScope = options.cfDomainIsDefault === true || config.ecsFallbackSubnet ? await ispScopeOf(ip, config, cache) : undefined;
   const ecsIp = ecsSourceIp(ip, config.ecsFallbackSubnet, ispTableReady() && ispScope === undefined);
+  const clientScope = clientScopeKey(ip);
   try {
     preferred = await preferredPool(
       { ipv4: options.preferredIpv4, ipv6: options.preferredIpv6 },
@@ -177,7 +177,7 @@ async function prepareDns(request: Request, env: Env, runtime: RequestRuntime): 
       options.cfDomainIsDefault === true,
       config,
       cache,
-      clientScopeKey(ip),
+      clientScope,
       options.cfDomainIsDefault === true ? ispScope : undefined,
     );
   } catch (error) {
@@ -196,7 +196,7 @@ async function prepareDns(request: Request, env: Env, runtime: RequestRuntime): 
     cfPreferredIpv6: preferred.ipv6,
   };
   const rules = await loadRules(config, cache);
-  return { config, options, cache, ip, lan: isLanClientAddress(ip), ecsIp, scope: preferred.scope, rules };
+  return { config, options, cache, ip, ecsIp, clientScope, scope: preferred.scope, rules };
 }
 
 /** ECS decision and cache key for one query. */
@@ -218,7 +218,7 @@ function planQuery(query: DnsPacket, setup: DnsSetup): { upstreamQuery: DnsPacke
   const useEcs = !useCn && ecs ? shouldUseEcs(query, config, override) : false;
   const upstreamQuery = useEcs && ecs ? addEcs(query, ecs) : removeEcs(query);
   const question = query.questions[0]!;
-  const variant = options.cacheVariant + strategyCacheTags(STRATEGIES, { config, options, scope: setup.scope, lan: setup.lan, name: question.name, type: question.type });
+  const variant = options.cacheVariant + strategyCacheTags(STRATEGIES, { config, options, scope: setup.scope, name: question.name, type: question.type });
   const ecsIdentity = useEcs && ecs ? ecs.identity : undefined;
   return { upstreamQuery, useEcs, useCn, ecsIdentity, identity: normalizedCacheIdentity(query, useCn ? "cn" : ecsIdentity ?? "none", variant) };
 }
@@ -254,6 +254,9 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
   const opts = query.additionals.filter((record) => record.type === DnsType.OPT);
   if (opts.length === 1 && ((opts[0]!.ttl >>> 16) & 0xff) !== 0) return dnsResponse(makeBadvers(query), wire);
   const client = readClientEcs(query);
+  // Set once prepareDns has resolved the client prefix; the early FORMERR/blocked replies below
+  // carry no address sets, so leaving it unset there is harmless.
+  let rotationSeed: string | undefined;
   // Every answer, cached or not, leaves with an OPT record made for this query (dns/edns.ts).
   const reply = (packet: Uint8Array): Response => {
     let body = packet;
@@ -262,12 +265,13 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
     } catch {
       // A packet we cannot re-encode is served as-is.
     }
-    return dnsResponse(body, wire);
+    return dnsResponse(body, wire, 200, rotationSeed);
   };
   if (opts.length > 1 || client === null) return reply(rcodeResponse(query, 1));
 
   const setup = await prepareDns(request, env, runtime);
   if (setup instanceof Response) return setup;
+  rotationSeed = setup.clientScope;
   const { config, options, cache, rules } = setup;
   const question = query.questions[0]!;
   const sample = () => ({ name: question.name, type: dnsTypeName(question.type), latencyMs: Date.now() - started });
@@ -285,7 +289,7 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
   const cached = await readCache(cache, identity, config);
 
   const resolveAndStore = async (): Promise<{ wire: Uint8Array; upstream: string; plan: RoutePlan }> => {
-    const resolved = await resolveFresh(query, upstreamQuery, useEcs, useCn, rules, options, config, cache, setup.lan);
+    const resolved = await resolveFresh(query, upstreamQuery, useEcs, useCn, rules, options, config, cache);
     ctx.waitUntil(writeCache(cache, identity, resolved.wire, config).catch((error: unknown) => {
       if (config.debug) console.warn(JSON.stringify({ event: "cache_write_error", message: errorMessage(error) }));
     }));
@@ -329,8 +333,7 @@ async function handleDns(request: Request, env: Env, ctx: WaitUntilContext, runt
  * "preferred-ip" only counts when the rewrite actually changed the answer (render.ts renames the
  * strategy then) and ECH counts even when a pool strategy had claimed the label first.
  */
-function pathCategory(plan: RoutePlan, useCn: boolean): "relay" | "ech" | "pool" | "cn" | "direct" {
-  if (plan.strategy === "relay") return "relay";
+function pathCategory(plan: RoutePlan, useCn: boolean): "ech" | "pool" | "cn" | "direct" {
   if (plan.ech) return "ech";
   if (useCn) return "cn";
   if (plan.pin || plan.xPool || plan.strategy === "preferred-ip") return "pool";
@@ -367,7 +370,6 @@ function domesticView(answer: DnsPacket): boolean {
   options: RequestOptions,
   config: AppConfig,
   cache: Cache,
-  lan: boolean,
   notes?: string[],
 ): Promise<{ wire: Uint8Array; upstream: string; plan: RoutePlan }> {
   const upstreamWire = encodeDnsPacket(upstreamQuery);
@@ -389,7 +391,7 @@ function domesticView(answer: DnsPacket): boolean {
   }
   const ruled = applyResponseRules(rules, query, originalResponse);
   if (ruled !== originalResponse) notes?.push("response rules changed the answer");
-  const { plan, ctx } = await makePlan(STRATEGIES, { config, options, query, rules, cache, lan, notes });
+  const { plan, ctx } = await makePlan(STRATEGIES, { config, options, query, rules, cache, notes });
   const transformed = renderPlan(plan, ctx, config, originalResponse, ruled);
   const responseWire = transformed === originalResponse ? result.packet : encodeDnsPacket(transformed);
   return { wire: patchTransactionId(responseWire, query.header.id), upstream: result.upstream, plan };
@@ -433,7 +435,7 @@ async function handleExplain(request: Request, env: Env, runtime: RequestRuntime
     let routePlan: Record<string, unknown> | undefined;
     let error: string | undefined;
     try {
-      const resolved = await resolveFresh(query, plan.upstreamQuery, plan.useEcs, plan.useCn, setup.rules, setup.options, setup.config, setup.cache, setup.lan, notes);
+      const resolved = await resolveFresh(query, plan.upstreamQuery, plan.useEcs, plan.useCn, setup.rules, setup.options, setup.config, setup.cache, notes);
       fresh = parseDnsPacket(resolved.wire);
       routePlan = describePlan(resolved.plan);
     } catch (caught) {
@@ -461,9 +463,6 @@ async function handleExplain(request: Request, env: Env, runtime: RequestRuntime
   return json({
     name,
     clientIp: setup.ip ?? null,
-    // Why the relay did or did not apply for this client: the LAN gate is unconditional by design
-    // (relay.ts / DESIGN.md §2.1.1), so this one boolean is the whole story. Informational only.
-    lan: setup.lan,
     pool: { ipv4: setup.config.cfPreferredIpv4, ipv6: setup.config.cfPreferredIpv6, scope: setup.scope ?? "default" },
     results: results.map(({ packet: _packet, ...rest }) => rest),
     chromium: a && aaaa && https ? chromiumEchVerdict(a, aaaa, https) : null,
@@ -502,10 +501,6 @@ export async function handleRequest(request: Request, env: Env, ctx: WaitUntilCo
   if (url.pathname === "/admin/preferred") return handleAdminPreferred(request, env, runtime);
   if (url.pathname === "/admin/github") return handleAdminGithub(request, env);
   if (url.pathname === "/admin/site") return handleAdminSite(request, env);
-  if (url.pathname === "/admin/relay") return handleAdminRelay(request, env);
-  if (url.pathname === "/admin/relay-config") return handleAdminRelayConfig(request, env);
-  if (url.pathname === "/admin/relay-health") return handleAdminRelayHealth(request, env);
-  if (url.pathname === "/admin/pool") return handleAdminPool(request, env);
   if (url.pathname === "/admin/health") return handleAdminHealth(request, env);
   if (url.pathname === "/admin/selfcheck") return handleAdminSelfCheck(request, env);
   if (url.pathname === "/admin/h3") return handleAdminH3(request, env);
@@ -542,8 +537,8 @@ async function preferredAuth(request: Request, env: Env): Promise<"admin" | "hub
   return new Response("Unauthorized", { status: 401 });
 }
 
-function adminState(config: AppConfig): Record<string, unknown> {
-  return { learned: learnedPoolStatus() ?? null, scoped: scopedPoolStatus(), isp: ispPoolStatus(), github: githubPoolStatus() ?? null, sites: sitePoolStatus() ?? null, safe: safeStatus() ?? null, chineseSites: chineseSiteStatus() ?? null, metaEch: metaEchStatus() ?? null, relay: relayStatus(config), selfcheck: selfCheckStatus(), h3: h3Status() };
+function adminState(): Record<string, unknown> {
+  return { learned: learnedPoolStatus() ?? null, scoped: scopedPoolStatus(), isp: ispPoolStatus(), github: githubPoolStatus() ?? null, sites: sitePoolStatus() ?? null, safe: safeStatus() ?? null, chineseSites: chineseSiteStatus() ?? null, metaEch: metaEchStatus() ?? null, selfcheck: selfCheckStatus(), h3: h3Status() };
 }
 
 /**
@@ -558,7 +553,7 @@ async function handleAdminStats(request: Request, env: Env): Promise<Response> {
   return json({
     ok: true,
     ...statsSnapshot(),
-    pools: adminState(readConfig(env)),
+    pools: adminState(),
     ...(typeof process !== "undefined" && typeof process.memoryUsage === "function" ? { memory: { rssBytes: process.memoryUsage().rss } } : {}),
   });
 }
@@ -632,164 +627,6 @@ async function readHostReport(request: Request): Promise<{ source: string; ttl: 
 }
 
 
-/**
- * SNI relay state (contrib/home/relay): GET reports liveness and the per-host decisions; the relay
- * daemon POSTs its self-check verdict {source, ttl, healthy[, direct]} so the server can withdraw
- * the override the moment the relay or the egress proxy dies. The health response carries the
- * effective domain lists so the daemon can pick console edits without a restart. State is in relay.ts.
- */
-async function handleAdminRelay(request: Request, env: Env): Promise<Response> {
-  const denied = await adminAuth(request, env);
-  if (denied) return denied;
-  if (request.method !== "GET") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET" } });
-  return json({ ok: true, relay: relayStatus(readConfig(env)) });
-}
-
-/**
- * The console's control plane: overrides RELAY_MODE / RELAY_DOMAINS / RELAY_EXCLUDE_DOMAINS and the
- * forced pool's RELAY_FORCED_MODE / RELAY_FORCED_DOMAINS at runtime. A change takes effect on the
- * next resolution (the relay cache tag re-keys answers), is persisted by the Node server across
- * restarts, and is pushed to the relay daemon through the health-report response. `reset: true`
- * clears the override, returning to the env values. `expectedVersion` is the configVersion the
- * caller last saw: a mismatch means someone else changed the config in between and yields 409
- * rather than a silent last-write-wins.
- */
-async function handleAdminRelayConfig(request: Request, env: Env): Promise<Response> {
-  const denied = await adminAuth(request, env);
-  if (denied) return denied;
-  if (request.method !== "GET" && request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, POST" } });
-  const config = readConfig(env);
-  if (request.method === "GET") return json({ ok: true, relay: relayStatus(config) });
-  let body: { mode?: unknown; domains?: unknown; excludeDomains?: unknown; forcedMode?: unknown; forcedDomains?: unknown; reset?: unknown; expectedVersion?: unknown };
-  try {
-    body = await request.json();
-  } catch {
-    return new Response("Invalid JSON", { status: 400 });
-  }
-  const current = relayStatus(config);
-  if (typeof body.expectedVersion === "number" && Number.isFinite(body.expectedVersion) && body.expectedVersion !== current.configVersion) {
-    return json({ ok: false, error: `config version mismatch: expected ${body.expectedVersion}, current ${current.configVersion}; refresh and retry`, configVersion: current.configVersion }, 409);
-  }
-  if (body.reset === true) {
-    setRelayOverride(null, config);
-    return json({ ok: true, changed: true, relay: relayStatus(config) });
-  }
-  const patch: { mode?: typeof config.relayMode; domains?: string[]; excludeDomains?: string[]; forcedMode?: typeof config.relayForcedMode; forcedDomains?: string[] } = {};
-  if (body.mode !== undefined) {
-    if (body.mode !== "off" && body.mode !== "auto" && body.mode !== "always") {
-      return new Response("mode must be \"off\", \"auto\" or \"always\"", { status: 400 });
-    }
-    patch.mode = body.mode;
-  }
-  if (body.forcedMode !== undefined) {
-    // The forced pool has no measurement loop, so "auto" is not a value it can honor.
-    if (body.forcedMode !== "off" && body.forcedMode !== "always") {
-      return new Response("forcedMode must be \"off\" or \"always\" (the forced pool has no auto: its names have no measured pool to judge them by)", { status: 400 });
-    }
-    patch.forcedMode = body.forcedMode;
-  }
-  // ECH names cannot go through the relay: the relay steers by reading SNI, and an ECH name's outer
-  // SNI no longer points at the real target (the HTTPS cleanup would strip the ECH key anyway —
-  // the entry is rejected so the operator notices before clients lose ECH, DESIGN.md §10).
-  const echPatterns = [...(config.echEnabled ? config.echDomains : []), ...config.metaDomains, ...config.xDomains];
-  const echConflicts = (patterns: string[]): string[] =>
-    patterns.filter((entry) => echPatterns.some((ech) => domainMatches(entry.replace(/^\*\./, ""), [ech])));
-  const readPatterns = (value: unknown, field: string): string[] | Response => {
-    if (!Array.isArray(value)) return new Response(`${field} must be an array of domain patterns`, { status: 400 });
-    if (value.length > 64) return new Response(`${field} is limited to 64 patterns`, { status: 400 });
-    if (value.some((entry) => typeof entry !== "string")) return new Response(`${field} must contain only strings`, { status: 400 });
-    const invalid = (value as string[]).filter((entry) => parseRelayDomainPattern(entry) === null);
-    if (invalid.length > 0) {
-      return new Response(`${field} has invalid entries (hostnames, optionally *.prefixed): ${invalid.slice(0, 3).join(", ")}`, { status: 400 });
-    }
-    const conflicts = echConflicts(value as string[]);
-    if (conflicts.length > 0) {
-      return new Response(`${field} entries conflict with ECH domains (the relay reads SNI, ECH encrypts it): ${conflicts.slice(0, 5).join(", ")}`, { status: 400 });
-    }
-    return [...new Set((value as string[]).map((entry) => parseRelayDomainPattern(entry)!))];
-  };
-  if (body.domains !== undefined) {
-    const domains = readPatterns(body.domains, "domains");
-    if (domains instanceof Response) return domains;
-    patch.domains = domains;
-  }
-  if (body.excludeDomains !== undefined) {
-    const excludes = readPatterns(body.excludeDomains, "excludeDomains");
-    if (excludes instanceof Response) return excludes;
-    patch.excludeDomains = excludes;
-  }
-  if (body.forcedDomains !== undefined) {
-    const forced = readPatterns(body.forcedDomains, "forcedDomains");
-    if (forced instanceof Response) return forced;
-    patch.forcedDomains = forced;
-  }
-  if (Object.keys(patch).length === 0) return new Response("nothing to change: mode, domains, excludeDomains, forcedMode, forcedDomains or reset required", { status: 400 });
-  // Turning the relay up needs a usable address; env typos must surface here rather than degrade silently.
-  const nextMode = patch.mode ?? current.mode;
-  if (nextMode !== "off" && !config.relayIp) {
-    return new Response("relay not deployed: RELAY_IP is missing or not a private address (mode stays as-is)", { status: 400 });
-  }
-  const nextForcedMode = patch.forcedMode ?? current.forcedMode;
-  if (nextForcedMode !== "off" && !config.relayIp) {
-    return new Response("relay not deployed: RELAY_IP is missing or not a private address (forcedMode stays as-is)", { status: 400 });
-  }
-  // Fields left out of the request keep their current override values (absent = env), like a PATCH.
-  const merged = { ...(relayOverrideSnapshot() ?? {}), ...patch } as typeof patch;
-  const changed = setRelayOverride(merged, config);
-  if (changed) console.log(JSON.stringify({ event: "relay_config_updated", fields: Object.keys(patch), configVersion: relayStatus(config).configVersion }));
-  return json({ ok: true, changed, relay: relayStatus(config) });
-}
-
-async function handleAdminRelayHealth(request: Request, env: Env): Promise<Response> {
-  const denied = await adminAuth(request, env);
-  if (denied) return denied;
-  if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { Allow: "POST" } });
-  let body: { source?: unknown; ttl?: unknown; healthy?: unknown; direct?: unknown; appliedConfigVersion?: unknown };
-  try {
-    body = await request.json();
-  } catch {
-    return new Response("Invalid JSON", { status: 400 });
-  }
-  const source = typeof body.source === "string" ? body.source.slice(0, 64) : "unknown";
-  const ttl = typeof body.ttl === "number" && Number.isFinite(body.ttl) ? Math.max(30, Math.min(3600, body.ttl)) : 120;
-  const appliedConfigVersion = typeof body.appliedConfigVersion === "number" && Number.isFinite(body.appliedConfigVersion) && body.appliedConfigVersion >= 0
-    ? Math.min(Math.floor(body.appliedConfigVersion), 2 ** 31)
-    : undefined;
-  setRelayHealth({ source, ttlSeconds: ttl, healthy: body.healthy === true, direct: readRelayDirectSamples(body.direct), ...(appliedConfigVersion !== undefined ? { appliedConfigVersion } : {}) });
-  return json({ ok: true, relay: relayStatus(readConfig(env)) });
-}
-
-/** direct: {"github.com": {ok: true, rttMs: 120}} — per-host handshake samples from the relay's prober. */
-function readRelayDirectSamples(value: unknown): Record<string, { ok: boolean; rttMs?: number }> | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined;
-  const direct: Record<string, { ok: boolean; rttMs?: number }> = {};
-  for (const [host, sample] of Object.entries(value)) {
-    const name = host.toLowerCase().replace(/\.$/, "");
-    if (!HOSTNAME.test(name)) continue;
-    if (typeof sample !== "object" || sample === null) continue;
-    const ok = (sample as { ok?: unknown }).ok === true;
-    const rtt = (sample as { rttMs?: unknown }).rttMs;
-    direct[name] = { ok, ...(typeof rtt === "number" && Number.isFinite(rtt) && rtt >= 0 ? { rttMs: rtt } : {}) };
-  }
-  return direct;
-}
-
-/**
- * The measured pool for one host, for the relay daemon to dial by address (githubPoolFor, else the
- * site pool): a relay-pinned name's /dns-query answer is the relay IP itself, so the daemon needs
- * this side channel to learn the addresses it should be dialing.
- */
-async function handleAdminPool(request: Request, env: Env): Promise<Response> {
-  const denied = await adminAuth(request, env);
-  if (denied) return denied;
-  if (request.method !== "GET") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET" } });
-  const name = (new URL(request.url).searchParams.get("name") ?? "").toLowerCase().replace(/\.$/, "");
-  if (!HOSTNAME.test(name)) return new Response("invalid name", { status: 400 });
-  const github = githubPoolFor(name);
-  const pool = github.length > 0 ? github : sitePoolFor(name);
-  return json({ ok: true, name, source: github.length > 0 ? "github-pool" : pool.length > 0 ? "site-pool" : "none", pool });
-}
-
 /** Prober QUIC+ECH verdicts: {source, ttl, verdicts: {"linux.do": true, "x.com": false}}. */
 async function handleAdminH3(request: Request, env: Env): Promise<Response> {
   const denied = await adminAuth(request, env);
@@ -848,7 +685,7 @@ async function handleAdminSelfCheck(request: Request, env: Env): Promise<Respons
 async function handleAdminHealth(request: Request, env: Env): Promise<Response> {
   const denied = await adminAuth(request, env);
   if (denied) return denied;
-  if (request.method === "GET") return json({ ok: true, ...adminState(readConfig(env)) });
+  if (request.method === "GET") return json({ ok: true, ...adminState() });
   if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, POST" } });
   let body: { metaEch?: unknown; echConfig?: unknown; verified?: unknown; ttl?: unknown; source?: unknown; reason?: unknown };
   try {
@@ -888,7 +725,7 @@ async function handleAdminHealth(request: Request, env: Env): Promise<Response> 
     default:
       return new Response("metaEch must be \"ok\", \"rotated\" or \"broken\"", { status: 400 });
   }
-  return json({ ok: true, ...adminState(readConfig(env)) });
+  return json({ ok: true, ...adminState() });
 }
 
 
@@ -898,7 +735,7 @@ async function handleAdminPreferred(request: Request, env: Env, runtime: Request
   const role = await preferredAuth(request, env);
   if (role instanceof Response) return role;
   const hubOnly = "The hub token may only write operator pools (POST with scope \"isp:<name>\")";
-  if (request.method === "GET") return role === "admin" ? json({ ok: true, ...adminState(readConfig(env)) }) : new Response(hubOnly, { status: 403 });
+  if (request.method === "GET") return role === "admin" ? json({ ok: true, ...adminState() }) : new Response(hubOnly, { status: 403 });
   if (request.method !== "POST") return new Response("Method not allowed", { status: 405, headers: { Allow: "GET, POST" } });
   let body: { ipv4?: unknown; ipv6?: unknown; ttl?: unknown; source?: unknown; scope?: unknown };
   try {
@@ -946,7 +783,7 @@ async function handleAdminPreferred(request: Request, env: Env, runtime: Request
     const pool = setLearnedPool(ipv4, ipv6, ttl, source, scope);
     console.log(JSON.stringify({ event: "preferred_pool_updated", source, scope: scope ?? "default", ipv4: pool.ipv4.length, ipv6: pool.ipv6.length, ttl }));
     if (role === "hub") return json({ ok: true, scope, ipv4: pool.ipv4.length, ipv6: pool.ipv6.length, expiresAt: pool.expiresAt });
-    return json({ ok: true, scope: scope ?? "default", ...adminState(readConfig(env)) });
+    return json({ ok: true, scope: scope ?? "default", ...adminState() });
   } catch (error) {
     return new Response(`Invalid address: ${errorMessage(error)}`, { status: 400 });
   }
